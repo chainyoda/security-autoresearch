@@ -1,13 +1,16 @@
 # Multiplayer Autoresearch — Competitive Whitehat Audit Harness
 
-**Status:** Design (v0.2) · **Deliverable:** architecture + data model + scoring spec
+**Status:** Design (v0.3) · **Deliverable:** architecture + data model + scoring spec
 **Date:** 2026-06-07 · **Companion:** `RUBRIC.md` (dedup & severity detail)
 
 A competition where multiple isolated LLM auditor agents race to find and prove
 security bugs in a DeFi protocol. Each agent works blind to the others but sees a
 live leaderboard of claimed bug slots. A judge verifies findings, dedups them,
 runs the attached Foundry PoC against an anvil fork, assigns Immunefi-style
-severity, and awards severity-weighted points. First valid report of a bug wins it.
+severity, **measures the funds-at-risk the PoC actually moves on the fork**, and
+awards points scaled by that measured magnitude. Distinct bugs each score on
+their own merits; for a true duplicate of one bug, the earliest valid report
+holds the slot.
 
 ---
 
@@ -196,14 +199,20 @@ claimed*, not *how* — enough to redirect effort, not enough to copy a finding.
    fix. Duplicate → `dup`; points go to the **earliest valid** submitter, ordered
    by a single orchestrator intake clock (not agent-reported timestamps, which
    are spoofable — `RUBRIC.md` §A.5).
-3. **PoC execution** — run `test_fn` against a **fresh fork snapshot** at
-   `fork_block`. Must pass and its assertion must actually demonstrate the
-   claimed impact. Fork is reverted after each run.
+3. **PoC execution + value measurement** — run `test_fn` against a **fresh fork
+   snapshot** at `fork_block`. Must pass and its assertion must actually
+   demonstrate the claimed impact. The harness instruments the run: it snapshots
+   the balances of in-scope contracts + the attacker before and after, and
+   computes `funds_at_risk` = value extracted (attacker net gain) + value
+   permanently frozen, normalized to a fraction of in-scope TVL (`RUBRIC.md`
+   §B.6). The **agent never reports this number** — the judge's wrapper measures
+   it from the PoC. Fork is reverted after each run.
 4. **Severity assignment (Immunefi-style)** — judge sets severity from
    impact × likelihood per the rubric in §7.2, using the PoC as evidence. The
    agent's `claimed_severity` is only a hint. PoC caps severity: no
    demonstrated fund-loss/insolvency → capped at Medium.
-5. **Award** — points by final severity (§7.3), plus bonuses; write to board.
+5. **Award** — base points by final severity (§7.3), scaled by the measured
+   magnitude multiplier (§7.3) and bonuses; write to board.
 
 ### 7.2 Severity rubric (Immunefi-flavored)
 | Severity | Definition (DeFi) |
@@ -223,6 +232,14 @@ challenges a specific axis level, not an overall feeling. The PoC caps the
 impact axis: no demonstrated effect → no claimed impact (`RUBRIC.md` §B.1).
 
 ### 7.3 Points
+The severity band sets the **floor** (the *kind* of bug); the judge-measured
+funds-at-risk sets where the award lands *within/above* that floor (the *size*).
+Severity stays categorical; magnitude is the continuous multiplier.
+
+```
+points = base[severity] × magnitude_multiplier × (1 + Σ bonuses)
+```
+
 | Severity | Base points |
 |---|---|
 | Critical | 100 |
@@ -231,10 +248,24 @@ impact axis: no demonstrated effect → no claimed impact (`RUBRIC.md` §B.1).
 | Low | 3 |
 | Info | 1 |
 
-**Bonuses (multiplicative/additive, capped):**
+**Magnitude multiplier (judge-measured, §`RUBRIC.md` B.6):** a function of
+`funds_at_risk` as a fraction of in-scope TVL, in `[m_min, m_max]` (default
+`[0.5, 2.0]`). A finding that drains most of the protocol scores ~2× its band's
+base; a band-qualifying finding that moves only a token amount scores ~0.5×. The
+multiplier **never crosses band boundaries** — it sizes within a band, it does
+not promote a High into Critical territory (severity already did that). For
+non-extractive findings (pure griefing/DoS with no funds moved), magnitude = 1.0
+(the band alone scores it).
+
+**Bonuses (additive into the `(1 + Σ)` term, capped):**
 - Correct, minimal `suggested_fix` patch that applies: **+15%**
 - Clean self-contained PoC (no judge edits needed): **+10%**
-- First blood on a slot already: inherent (dupes get 0).
+
+**Distinct bugs score additively.** When different agents prove *different*
+exploits, each is its own award (the dedup test in `RUBRIC.md` §A decides
+distinct vs. dup). There is no contest between them — both score their full
+band × magnitude. Only a **true duplicate of the same bug** is a contest: the
+earliest valid submission holds the slot (`RUBRIC.md` §A.5); later dups get 0.
 
 **No penalties in v0.1** beyond wasted budget. Rationale: keep agents
 aggressive; revisit if spam dominates (§11).
@@ -299,6 +330,9 @@ of improvised per verdict.
   "budget": { "wall_clock": "60m", "max_tokens": 5_000_000, "max_concurrency": 8 },
   "scoring": { "points": { "critical": 100, "high": 40, "medium": 10,
                            "low": 3, "info": 1 },
+               "magnitude": { "m_min": 0.5, "m_max": 2.0,
+                              "tvl_basis": "in_scope_contracts",
+                              "price_source": "pinned-external-oracle@fork_block" },
                "bonuses": { "applied_fix": 0.15, "clean_poc": 0.10 } },
   "threat_model": {
     "trusted_roles": ["owner (3/5 multisig)", "governance timelock"],
@@ -321,7 +355,8 @@ match/<match_id>/
   submissions/<sub_id>.json
   pocs/<sub_id>/…          # PoC test files as submitted
   verdicts/<sub_id>.json   # decision, dedup result, (impact_level, likelihood_level,
-                           #   cell, per-axis justification), verifier votes
+                           #   cell, per-axis justification), funds_at_risk +
+                           #   tvl_fraction + magnitude_multiplier, verifier votes
   match-result.json        # final standings, master vuln list
   report.md                # human summary (+ recall/precision if seeded)
 ```

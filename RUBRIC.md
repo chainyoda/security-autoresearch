@@ -1,7 +1,7 @@
 # Dedup & Severity Rubric
 
 **Companion to** `DESIGN.md` §7 (Judge & scoring) and §11.4 (dedup hardness).
-**Status:** Design (v0.1) · **Date:** 2026-06-07
+**Status:** Design (v0.2) · **Date:** 2026-06-07
 
 This is the part of the harness most likely to be *wrong* — both judgments are
 semantic, not mechanical. The goal here is to push as much of each call as
@@ -95,10 +95,15 @@ fix summary). If absent, stage 2 is skipped and we rely on stage 3. This is a
 concrete argument for **making the fix patch mandatory, not bonus** — see the
 recommendation in §C.
 
-### A.5 First-valid-wins & ordering
-- Award goes to the **earliest valid submission** by `timestamp` among a dup
-  cluster. "Valid" = passed PoC gate. A non-compiling earlier submission does
-  **not** hold the slot.
+### A.5 Dup ordering (distinct findings don't compete)
+First, the thing this section is **not**: distinct bugs do not contend for a
+slot. If A and B prove different exploits (stage 1/2 say DISTINCT), each gets its
+own award at its own band × magnitude (`DESIGN.md` §7.3). Ordering only matters
+*inside a single dup cluster* — multiple agents landing on the **same** bug.
+
+- Within a dup cluster, the award goes to the **earliest valid submission** by
+  intake order. "Valid" = passed PoC gate. A non-compiling earlier submission
+  does **not** hold the slot.
 - Race window: a finding is `under-review` from intake until verdict. If B
   submits a dup while A is still `under-review`, B is queued behind A; if A
   resolves valid, B is marked `dup`; if A fails its PoC, B is re-evaluated as
@@ -143,7 +148,10 @@ feed Y staleness). Stage 2: neither fix blocks the other's PoC. → **DISTINCT.*
 Severity must be **computed and justified**, never vibed. The judge fills a
 fixed `impact × likelihood` matrix, the PoC caps the impact axis (you can't
 claim fund-loss you didn't demonstrate), and the result maps deterministically
-to a severity band. The agent's `claimed_severity` is a hint only.
+to a severity band. The agent's `claimed_severity` is a hint only. The band is
+then sized within itself by a **judge-measured magnitude multiplier** (B.6) — how
+much value the PoC actually moved — so a $50M drain and a $50k drain in the same
+band score differently.
 
 ### B.1 Impact axis (set by what the PoC demonstrates)
 | Level | DeFi meaning | PoC must show |
@@ -216,6 +224,49 @@ guardrail → **Info / out-of-threat-model.** No points.
 no profit to attacker, victims pay gas + slippage. Impact I3 (griefing).
 Likelihood L5. I3×L5 = **HIGH.** (Pure griefing *can* be High when trivially
 triggerable — the matrix captures this without the judge having to "feel" it.)
+
+### B.6 Magnitude measurement (sizes the award within a band)
+Severity (B.3) gives the band; this gives the **multiplier inside it**. The judge
+measures it from the PoC run — the agent never reports it.
+
+**What is measured.** During PoC execution (`DESIGN.md` §7.1 step 3) the harness
+snapshots balances before/after across all tracked tokens for the in-scope
+contracts and the attacker, then:
+```
+funds_at_risk = value_extracted (attacker net gain across tracked tokens)
+              + value_frozen    (funds rendered permanently unwithdrawable)
+tvl_fraction  = funds_at_risk / in_scope_TVL        # at the fork block
+magnitude_multiplier = clamp(m_min, m_max,
+                             m_min + (m_max - m_min) * scale(tvl_fraction))
+```
+Default `scale` is `sqrt(tvl_fraction)` so the curve rises fast then flattens —
+a 5% drain already earns most of the bonus, a 100% drain caps it. Defaults
+`m_min=0.5, m_max=2.0` (from `match.config.json.scoring.magnitude`).
+
+**Rules that keep it honest:**
+1. **Valuation uses a pinned external price source** fixed at `fork_block`, off
+   the protocol's own manipulable pools. An exploit that tanks the pool price
+   must not be valued at the post-exploit price it created — that would let
+   agents launder the magnitude through whichever token the sim prices highest.
+2. **Normalize to TVL, never raw dollars.** On a seeded fork the absolute numbers
+   are arbitrary (we seeded the vault). `tvl_fraction` is portable across targets
+   and across the seeded→real transition; absolute USD is not.
+3. **Frozen ≠ stolen, but both count** at full value by default (a permanent
+   freeze is as bad as theft to the victim). `match.config.json` may down-weight
+   `value_frozen` per target if the threat model treats DoS as lesser.
+4. **The multiplier stays inside its band.** It scales `base[severity]`; it never
+   promotes a High into the Critical *base*. Severity already decided the band
+   from impact × likelihood; magnitude only sizes within it. (A tiny-but-trivial
+   bug and a huge-but-conditional one already differ via the L axis — magnitude
+   is orthogonal: *how much moved*, not *how reachable*.)
+5. **Non-extractive findings get magnitude = 1.0.** Pure griefing/DoS moves no
+   funds; the band alone scores it (no measured magnitude to apply).
+
+**Worked.** Ex.1 (CRIT, oracle drain) moves 80% of pool TVL → `tvl_fraction
+≈ 0.8`, `sqrt ≈ 0.89`, multiplier ≈ `0.5 + 1.5*0.89 ≈ 1.84`. Award ≈
+`100 × 1.84 = 184` before bonuses. A second CRIT oracle bug on a different feed
+(Ex.4, DISTINCT) that only reaches 4% of TVL → `sqrt ≈ 0.2`, multiplier ≈ `0.8`,
+award ≈ `80`. Both score; the bigger drain is worth more, same band.
 
 ---
 
