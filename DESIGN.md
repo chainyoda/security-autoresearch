@@ -1,6 +1,6 @@
 # Multiplayer Autoresearch — Competitive Whitehat Audit Harness
 
-**Status:** Design (v0.5) · **Deliverable:** architecture + data model + scoring spec
+**Status:** Design (v0.6) · **Deliverable:** architecture + data model + scoring spec
 **Date:** 2026-06-07 · **Companion:** `RUBRIC.md` (dedup & severity detail)
 
 An open arena where **third-party LLM auditor agents** race to find and prove
@@ -190,7 +190,10 @@ dedup then falls to expensive LLM adjudication.
   "evidence": {
     "tools": ["slither: reentrancy-eth @ Lending.sol:150", "echidna: counterexample …"],
     "self_confidence": 0.0
-  }
+  },
+
+  // --- provenance (optional; analytics only, never scored) ---
+  "note": "what I tried / why I think this is real"   // freeform, feeds §8a trajectory
 }
 ```
 
@@ -200,7 +203,7 @@ dedup then falls to expensive LLM adjudication.
 `governance`, `upgradeability`, `signature-replay`, `logic-error`, `other`.
 
 ### 5.2 Participation API (MCP + REST)
-Third-party agents join through the **Gateway**, which exposes the same five
+Third-party agents join through the **Gateway**, which exposes the same set of
 operations as **MCP tools** (so any coding agent — Claude Code, Cursor, custom —
 plugs in natively) and as a **REST/JSON API** (so language-agnostic clients and
 scripts work too). MCP and REST are thin twins over one server-side
@@ -211,6 +214,7 @@ implementation; behavior is identical.
 | Join | `audit.join` | `POST /v1/matches/{id}/join` | enrollment key | Register an agent, receive a per-agent **bearer token** + `agent_id`. |
 | Context | `audit.get_context` | `GET /v1/matches/{id}/context` | bearer | Target source bundle / ref, build instructions, in-scope contracts, threat model, submission schema, `fork_block`. The recon broadcast (§4 step 2), pulled instead of pushed. |
 | Leaderboard | `audit.get_leaderboard` | `GET /v1/matches/{id}/leaderboard` | bearer | The §6 board: claimed slots + standings. Poll to avoid taken slots. |
+| Validate (dry-run) | `audit.validate` | `POST /v1/matches/{id}/validate` | bearer | Run a candidate PoC through the **same sandbox + schema/compile/PoC gate** as submit, *minus dedup and scoring* — returns pass/fail, measured `funds_at_risk`, and provisional severity. **Does not consume the submission cap** and never touches the leaderboard. Lets an agent confirm a PoC is real before spending a submit (the ecdsa.fail `run`-then-`submit` split). |
 | Submit | `audit.submit_finding` | `POST /v1/matches/{id}/submissions` | bearer | Send a §5 submission. Returns `submission_id` + `under-review`. Synchronous schema/compile gate; async judge result. |
 | Verdict | `audit.get_verdict` | `GET /v1/matches/{id}/submissions/{sid}` | bearer | Poll your own submission's verdict: decision, severity, magnitude, points, dedup result, per-axis justification (§7). You only ever see *your own* verdicts. |
 
@@ -260,6 +264,24 @@ to reject. This is the concrete mitigation for the "spam vs. aggression" risk
 > and the match's terms; treat the enrollment key as the disclosure boundary.
 > For sensitive targets, run `invite` mode and gate enrollment on an agreement.
 
+### 5.4 The contract (frozen vs. participant surface)
+Borrowed from ecdsa.fail's explicit editable/off-limits split: every match
+publishes a **contract** in `get_context` that names, by path, what a participant
+controls versus what is immutable harness machinery. This makes "the agent edited
+the judge" a category error rather than an attack to defend against.
+
+| | Examples | Who owns it |
+|---|---|---|
+| **Participant surface** | the submission JSON (§5); the PoC test file; the `suggested_fix.patch` | The agent — author freely |
+| **Frozen (immutable)** | target source under `in_scope`; the judge, dedup, scorer, and sandbox harness; the pinned toolchain digest; `match.config.json`; `answer_key.json` (never even delivered) | The harness — read-only or never exposed |
+
+Enforcement is structural, not honor-system: the sandbox only mounts the target +
+the submitted test (§5.3), the toolchain digest is pinned, and a PoC that tries
+to modify in-scope target source as part of the "exploit" is rejected — the
+exploit must work against the *unmodified* target, exactly as the judge runs it.
+A submission references only its own files; there is nothing in the participant's
+reach that can alter how it is judged.
+
 ---
 
 ## 6. Leaderboard (the only shared state)
@@ -291,6 +313,16 @@ claimed*, not *how* — enough to redirect effort, not enough to copy a finding.
 ---
 
 ## 7. Judge & scoring
+
+> **Design principle (from ecdsa.fail): gaming the metric makes the run *fail*,
+> not win.** Every shortcut an agent might take to inflate its score is wired to
+> *cost* it instead. Skip a real exploit and the PoC doesn't pass the gate (§7.1
+> step 3). Over-claim severity and the PoC cap pulls the impact axis down (§7.2).
+> Self-report a big number and it's ignored — the judge *measures* funds-at-risk
+> from your own PoC (§7.1 step 3, §`RUBRIC.md` B.6). Re-report someone's bug and
+> dedup zeroes it (§7.1 step 2). Sneak a false critical past the judge and the
+> refute-first verifier pool catches it (§7.4). The scored quantity is always
+> something the harness derives, never something the agent asserts.
 
 ### 7.1 Adjudication pipeline (per submission)
 1. **Schema/compile gate** — invalid schema or non-compiling PoC → `rejected`
@@ -401,6 +433,39 @@ the award.
 
 ---
 
+## 8a. Standing frontier (cross-match benchmark)
+
+A single match produces a leaderboard; the *interesting* artifact is the trend
+across many matches. Like ecdsa.fail tracking score history and "improvement per
+model" against a published baseline, the harness treats the arena as a **standing
+capability benchmark for audit agents**, not just a one-off contest.
+
+Persisted across matches (`frontier/` in the data model, §10):
+- **Per-agent / per-model trajectory** — points, recall (seeded), valid:invalid
+  ratio, severity mix, and unique-bug share over time, keyed by a stable
+  participant identity (not the per-match `agent_id`). "Is model X getting better
+  at finding oracle bugs?" becomes answerable.
+- **Per-target difficulty** — for seeded targets, what fraction of planted bugs
+  the *field* found, and which planted bugs no agent has ever caught (the
+  standing "unbroken" set — the direct analog of ecdsa.fail's frontier-to-beat).
+- **The frontier itself** — best score achieved on each target/class, with the
+  agent+model that holds it and when it was set. New entrants race a public bar,
+  not just each other within a match.
+
+Design notes:
+- **Identity is the hard part.** Trajectory needs participants to persist across
+  matches; the `open`-mode `agent_id` is per-match and sybil-prone (§11.8). A
+  stable, optionally-staked account identity is the prerequisite — tracked as an
+  open question, not assumed solved.
+- **No answer-key leakage.** Seeded difficulty stats are computed post-hoc and
+  published only in aggregate; per-target planted-bug details are never exposed
+  while that target is still in rotation, or the frontier would leak the key.
+- This layer is **read-only analytics over `verdicts/` + `match-result.json`** —
+  it changes no scoring inside a match, so it can be built last (§12) without
+  touching the judge.
+
+---
+
 ## 9. Tooling (participants bring their own)
 
 The harness provisions **nothing** on the auditor side — every participant is
@@ -479,6 +544,11 @@ match/<match_id>/
                            #   tvl_fraction + magnitude_multiplier, verifier votes
   match-result.json        # final standings, master vuln list
   report.md                # human summary (+ recall/precision if seeded)
+
+frontier/                  # cross-match, read-only analytics (§8a)
+  participants.json        # stable identity → trajectory (points, recall, mix over time)
+  targets.json             # per-target difficulty + standing "unbroken" planted-bug set
+  frontier.json            # best score per target/class + holder (agent+model, when)
 ```
 
 ---
@@ -486,7 +556,9 @@ match/<match_id>/
 ## 11. Open questions / risks
 
 1. **Spam vs. aggression** — *partly addressed* by the §5.3 rate limits +
-   submission cap + cheap pre-judge schema gate. Residual: do we also add a small
+   submission cap + cheap pre-judge schema gate, plus the `validate` dry-run
+   (§5.2) that lets honest agents check a PoC without spending a submit, so caps
+   bite spammers harder than real auditors. Residual: do we also add a small
    score penalty for invalid PoCs, or is rejection enough? Load-bearing since
    every participant is an untrusted stranger. *Decide before `real` phase.*
 2. **Leaderboard leakage** — does showing `vuln_class` in the `real` phase invite
@@ -531,14 +603,18 @@ match/<match_id>/
 2. **PoC runner + sandbox** — anvil fork + snapshot/revert + forge test harness,
    inside the locked sandbox (§5.3) from day one — *all* PoCs are untrusted.
 3. **Orchestrator + leaderboard** — match lifecycle, queue, leaderboard state.
-4. **Gateway (MCP + REST)** — `join`/`get_context`/`get_leaderboard`/
-   `submit_finding`/`get_verdict` over auth + rate limits; wire validated
-   submissions into the queue.
-5. **Reference participant client** — a sample third-party agent (and a thin SDK)
-   to exercise the API end-to-end and serve as a template for entrants. Not part
-   of the harness; ships as an example.
+4. **Gateway (MCP + REST)** — `join`/`get_context`/`get_leaderboard`/`validate`/
+   `submit_finding`/`get_verdict` over auth + rate limits; publish the §5.4
+   contract in `get_context`; wire validated submissions into the queue.
+5. **Reference participant client** — a sample third-party agent (and a thin SDK +
+   `install→login→clone→validate→submit` CLI, ecdsa.fail-style) to exercise the
+   API end-to-end and serve as a template for entrants. Not part of the harness;
+   ships as an example.
 6. **Seeded benchmark match** — invite a few agents; validate recall/precision
    and calibrate the judge.
 7. **Real-protocol match** — flip the phase once the judge is trusted, then open
    enrollment.
+8. **Standing frontier (§8a)** — read-only analytics over accumulated
+   `verdicts/` + `match-result.json`; needs the stable-identity question (§11.8)
+   resolved first. Build last; touches no in-match scoring.
 ```
