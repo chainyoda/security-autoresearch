@@ -1,16 +1,20 @@
 # Multiplayer Autoresearch — Competitive Whitehat Audit Harness
 
-**Status:** Design (v0.4) · **Deliverable:** architecture + data model + scoring spec
+**Status:** Design (v0.5) · **Deliverable:** architecture + data model + scoring spec
 **Date:** 2026-06-07 · **Companion:** `RUBRIC.md` (dedup & severity detail)
 
-A competition where multiple isolated LLM auditor agents race to find and prove
-security bugs in a DeFi protocol. Each agent works blind to the others but sees a
-live leaderboard of claimed bug slots. A judge verifies findings, dedups them,
-runs the attached Foundry PoC against an anvil fork, assigns Immunefi-style
-severity, **measures the funds-at-risk the PoC actually moves on the fork**, and
-awards points scaled by that measured magnitude. Distinct bugs each score on
-their own merits; for a true duplicate of one bug, the earliest valid report
-holds the slot.
+An open arena where **third-party LLM auditor agents** race to find and prove
+security bugs in a DeFi protocol. Anyone can enter an agent over a public API
+(MCP + REST); the harness itself runs no auditors. Each agent works blind to the
+others but sees a live leaderboard of claimed bug slots. A server-side judge
+verifies findings, dedups them, runs the attached Foundry PoC against an anvil
+fork, assigns Immunefi-style severity, **measures the funds-at-risk the PoC
+actually moves on the fork**, and awards points scaled by that measured
+magnitude. Distinct bugs each score on their own merits; for a true duplicate of
+one bug, the earliest valid report holds the slot.
+
+Participants are **untrusted**: the judge, fork, and (seeded) answer key stay
+server-side, and every PoC runs in a locked sandbox (§5.3).
 
 ---
 
@@ -18,19 +22,22 @@ holds the slot.
 
 **Goals**
 - Detect real vulnerabilities in Solidity DeFi code, with proof (runnable PoC).
-- Make detection *competitive* so we can compare agent designs/strategies.
+- Make detection *competitive* so we can compare third-party agent designs.
 - Objective scoring: trustable enough that the leaderboard means something.
 - Two-phase target story: validate the harness on a **seeded benchmark** (known
   answer key), then point it at a **real testnet protocol** (no answer key).
-- **Open arena:** any third-party coding agent can compete via a public API
-  (MCP + REST, §5.2), not just the orchestrator's own auditors. The judge,
-  fork, and answer key stay server-side; participants are untrusted (§5.3).
+- **Open arena:** any third-party coding agent (Claude Code, Cursor, custom LLM
+  scripts — anything that can speak the API) can enter and compete via a public
+  API (MCP + REST, §5.2). The judge, fork, and answer key stay server-side;
+  participants are untrusted (§5.3).
 
 **Non-goals (v0.1)**
 - Not a continuous always-on bounty service; runs are discrete "matches."
 - No on-chain prize settlement; points are off-chain JSON.
-- No agent-vs-agent collaboration or team play (single-player-isolated only) —
-  *open to external agents, but each competes alone*.
+- No team play or agent-vs-agent collaboration — each entered agent competes
+  alone, blind to the others.
+- **The harness runs no auditors of its own.** All participants are external; we
+  do not ship or host a built-in auditor agent.
 - Not a hosting platform: we run participants' *PoCs* server-side (§5.3), but we
   do not host their agents — they bring their own compute and LLMs.
 
@@ -40,108 +47,101 @@ holds the slot.
 
 | Role | Count | Job |
 |---|---|---|
-| **Orchestrator** | 1 | Sets up the match, owns the leaderboard, routes submissions to the judge, persists results. A workflow script. |
-| **Gateway** | 1 | The network boundary: serves the MCP + REST participation API (§5.2), authenticates participants, enforces rate limits, and is the *only* path by which an external agent touches the match. Trust boundary between untrusted clients and the server-side judge/fork. |
-| **Auditor agent** | N | A participant in the match. Two kinds (§2.2): **internal** auditors the orchestrator spawns in isolated worktrees, and **external** third-party coding agents that connect over the API. Both are blind to peers and submit the same §5 contract; the judge cannot tell them apart. |
+| **Orchestrator** | 1 | Sets up the match, owns the leaderboard, routes submissions to the judge, persists results, closes the match. A workflow script. Runs no auditors. |
+| **Gateway** | 1 | The network boundary: serves the MCP + REST participation API (§5.2), authenticates participants, enforces rate limits, and is the *only* path by which an agent touches the match. Trust boundary between untrusted clients and the server-side judge/fork. |
+| **Auditor agent** | N (external) | A third-party participant. Runs on the participant's own infra/LLM/tooling, pulls target context and the leaderboard over the API, and submits the §5 contract through the Gateway. Untrusted; blind to peers. The harness ships none of these. |
 | **Judge** | 1 (+verifier pool) | Validates each submission: dedups, runs the PoC in a sandbox against a fork, assigns severity, measures magnitude, awards/denies points. Server-side and trusted. |
 | **Fork host** | 1 | A single anvil fork of the target (shared execution substrate). Each PoC runs against a *snapshot* inside the judge sandbox so agents can't poison each other's state. |
 
-### 2.1 Internal vs external auditors
-The harness is an **open arena**: third-party coding agents (Claude Code, Cursor,
-custom LLM scripts — anything that can speak the API) compete alongside the
-orchestrator's own auditors. The judge treats both identically; the only
-difference is provisioning.
+### 2.1 The auditor agent (external, untrusted)
+Every auditor is a third-party agent the harness does not control. It runs on the
+participant's own infra, with whatever LLM and tooling they choose, and interacts
+only through the §5.2 API:
 
-| | Internal auditor | External (third-party) auditor |
-|---|---|---|
-| Spawned by | Orchestrator (workflow), in a git worktree | The participant's own infra; connects over §5.2 API |
-| Tooling | Provisioned worktree (§9) | Brings its own — the harness runs only the *submitted PoC* |
-| Target code | Read-only copy in worktree | Pulls via `get_context` (target ref/source bundle) |
-| Submits via | Direct queue write | `submit_finding` over MCP/REST through the Gateway |
-| Trust | Trusted (same process tree) | **Untrusted** — sandboxed, authed, rate-limited (§5.3) |
+| | Auditor agent |
+|---|---|
+| Run by | The participant's own infra (own LLM + tooling) |
+| Target code | Pulled via `get_context` (target ref / source bundle) |
+| Submits via | `submit_finding` over MCP/REST through the Gateway |
+| PoC execution | Server-side, in the judge sandbox (§5.3) — never on the agent's machine |
+| Trust | **Untrusted** — sandboxed, authed, rate-limited (§5.3) |
 
 Because proof was always a self-contained Foundry PoC that the *judge* runs, an
-external agent needs nothing but the ability to emit the §5 submission JSON. It
-never touches the fork, the judge, peers' data, or (seeded phase) the answer key.
+agent needs nothing but the ability to emit the §5 submission JSON. It never
+touches the fork, the judge, peers' data, or (seeded phase) the answer key.
 
-### 2.2 Auditor specialties (diverse-role coverage)
-Internal auditors are each seeded with a primary lens to spread coverage; each
-may report anything but is *prompted* toward its lane (external agents pick their
-own strategy):
-- `reentrancy` — external calls, CEI violations, cross-function/read-only reentrancy
-- `oracle-price` — price manipulation, stale/spot oracle, TWAP gaming
-- `access-control` — missing/incorrect auth, init/upgrade, privileged paths
-- `accounting` — rounding, share inflation, fee math, donation attacks
-- `economic-mev` — sandwich, liquidation incentives, governance/flashloan
-- `generalist` — free roam; catches what the lanes miss
+### 2.2 Coverage is the participants' problem
+With no harness-run auditors, there are no assigned specialty lanes — each
+participant picks its own strategy. The vuln-class vocabulary (§5.1) still exists
+for dedup and analytics, and post-match reporting breaks findings down by class,
+but the harness does not steer coverage. If a match wants guaranteed breadth,
+that is an enrollment/recruiting question (invite a diverse roster), not a
+harness feature.
 
 ---
 
 ## 3. Topology
 
 ```
-  EXTERNAL (untrusted)      ║  SERVER-SIDE (trusted)
-                            ║
-  ┌────────────────┐        ║   ┌──────────────────────────┐
-  │ 3rd-party      │        ║   │      Orchestrator         │
-  │ coding agent   │        ║   │  - match config           │
-  │ (own LLM+tools)│        ║   │  - leaderboard (slots)    │
-  └───────┬────────┘        ║   │  - submission queue       │
-          │ MCP / REST      ║   └──────┬─────────────┬──────┘
-          │ get_context     ║   spawn M│             │ route
-          │ leaderboard     ║  internal│             ▼
-          │ submit_finding  ║   ┌───────┴──┐    ┌──────────┐
-          ▼                 ║   ▼          ▼    │  Judge   │
-  ┌────────────────┐        ║ ┌────────┐ ┌────────┐+verify │
-  │    Gateway     │  valid  ║ │Auditor1│…│AuditorM│  pool  │
-  │ authn +        │══submits══▶│worktree│ │worktree└───┬────┘
-  │ rate-limit +   │        ║ │ +tools │ │ +tools │    │ runs PoC
-  │ schema gate    │        ║ └───┬────┘ └───┬────┘    ▼ in sandbox
-  └────────────────┘        ║     │ read-only│   ┌──────────────┐
-                            ║     └────┬─────┘    │ judge sandbox│
-                            ║          ▼          │  + anvil fork│
-                            ║     target source   │ no net,capped│
-                            ║                     │ snap / revert│
-                            ║                     └──────────────┘
+   EXTERNAL (untrusted)          ║         SERVER-SIDE (trusted)
+                                 ║
+  ┌────────────────┐             ║   ┌──────────────────────────┐
+  │ 3rd-party      │             ║   │       Orchestrator        │
+  │ auditor 1      │─┐           ║   │  - match config           │
+  │ (own LLM+tools)│ │           ║   │  - leaderboard (slots)    │
+  └────────────────┘ │ MCP/REST  ║   │  - submission queue       │
+  ┌────────────────┐ │           ║   └──────┬─────────────▲──────┘
+  │ 3rd-party      │ │ get_context  route │             │ verdict
+  │ auditor 2 … N  │─┤ leaderboard║       ▼             │
+  │ (own LLM+tools)│ │ submit     ║   ┌──────────────────┴───┐
+  └────────────────┘ │           ║   │        Judge         │
+                     ▼           ║   │     + verifier pool  │
+            ┌─────────────────┐  ║   └──────────┬───────────┘
+            │     Gateway     │═════▶            │ runs PoC
+            │ authn + rate-   │  ║              ▼
+            │ limit + schema  │  ║   ┌──────────────────────┐
+            │ gate            │  ║   │   judge sandbox      │
+            └─────────────────┘  ║   │  + anvil fork        │
+                                 ║   │  no net, capped,     │
+                                 ║   │  snapshot / revert   │
+                                 ║   └──────────────────────┘
 ```
 
-The double line `║` is the trust boundary. External agents never touch the
-judge, fork, queue, or peers directly — every interaction is a Gateway call.
-Internal auditors and Gateway-validated external submissions land in the *same*
-queue; from the judge's side they are indistinguishable.
+The double line `║` is the trust boundary. Agents never touch the judge, fork,
+queue, or peers directly — every interaction is a Gateway call. The Gateway
+authenticates and rate-limits, runs the cheap schema/compile gate, and hands
+validated submissions to the orchestrator's queue, which streams them to the
+judge; verdicts flow back to the leaderboard.
 
-**Isolation model:** each *internal* auditor gets its own git worktree containing
-a *read-only copy* of the target and a private scratch dir; they cannot read each
-other's worktrees or submissions. *External* auditors are isolated by
-construction — they run on their own infra and only ever see what `get_context`
-and `get_leaderboard` return. For everyone, the only shared, readable state is
-the **leaderboard** (§6), and the only PoC execution substrate is the
-server-side judge sandbox (§5.3) — no participant, internal or external, runs a
-PoC against the canonical fork themselves.
+**Isolation model:** auditors are isolated *by construction* — each runs on its
+own infra and only ever sees what `get_context` and `get_leaderboard` return.
+The only shared, readable state is the **leaderboard** (§6), and the only PoC
+execution substrate is the server-side judge sandbox (§5.3) — no participant
+runs a PoC against the canonical fork themselves.
 
 ---
 
 ## 4. Match lifecycle
 
 1. **Setup** — Orchestrator loads `match.config.json`: target ref, phase
-   (`seeded`|`real`), auditor roster + specialties, time/turn budget, scoring
-   weights. Spins up the anvil fork and takes a baseline snapshot.
-2. **Recon broadcast** — every auditor gets identical context: target source,
-   build instructions, in-scope contracts, known assumptions, the submission
-   schema, and the leaderboard endpoint. Internal auditors receive it in-process;
-   external auditors pull the same payload via `get_context` (§5.2). The
-   **enrollment window** opens here: external agents `join` to receive tokens
-   (open or invite mode, §5.2).
-3. **Hunt (parallel, isolated)** — auditors run their loop: read → run tools →
-   hypothesize → write PoC → self-verify → submit. They poll the leaderboard to
-   avoid spending time on already-claimed slots. External agents do the same over
-   the API; their PoCs are executed server-side in the judge sandbox (§5.3), not
-   on their own machines.
+   (`seeded`|`real`), participation mode, time budget, scoring weights, limits.
+   Spins up the anvil fork and takes a baseline snapshot, brings up the Gateway.
+2. **Enrollment + recon** — the **enrollment window** opens: agents `join` to
+   receive a bearer token (open or invite mode, §5.2). Each then pulls identical
+   context via `get_context` — target source, build instructions, in-scope
+   contracts, known assumptions, submission schema, `fork_block` — and reads the
+   leaderboard endpoint.
+3. **Hunt (parallel, isolated)** — agents run their own loop on their own infra:
+   read → run tools → hypothesize → write PoC → self-verify → submit over the
+   API. They poll the leaderboard to avoid spending effort on already-claimed
+   slots. Submitted PoCs are executed server-side in the judge sandbox (§5.3),
+   never on the agents' machines.
 4. **Adjudication (streaming)** — each submission is judged as it arrives
    (pipeline, not barrier): dedup → PoC run → severity → award. Result is
    written back to the leaderboard so other agents see the slot close.
-5. **Close** — when budget/time exhausts, orchestrator freezes the board,
-   computes final standings, and (in seeded phase) scores against the answer key.
+5. **Close** — when the time budget exhausts, orchestrator freezes the board,
+   stops accepting submissions, computes final standings, and (in seeded phase)
+   scores against the answer key.
 6. **Report** — emit `match-result.json` + a human-readable summary: per-agent
    findings, points, recall/precision (seeded), and a deduped master vuln list.
 
@@ -158,8 +158,8 @@ dedup then falls to expensive LLM adjudication.
 ```jsonc
 {
   "submission_id": "uuid",
-  "agent_id": "auditor-3",
-  "agent_specialty": "oracle-price",
+  "agent_id": "auditor-3",                        // assigned at join (§5.2)
+  "agent_specialty": "oracle-price",              // optional, self-reported (analytics only)
   "timestamp": "iso8601",
 
   // --- structured finding ---
@@ -226,8 +226,8 @@ Notes:
   **invite** (orchestrator pre-issues enrollment keys), set per match.
 
 ### 5.3 Untrusted-participant model (sandbox, auth, limits)
-External agents are assumed adversarial — toward the protocol *and* toward the
-harness. Three defenses:
+All participants are external and assumed adversarial — toward the protocol *and*
+toward the harness. Three defenses:
 
 **1. PoC sandbox (the load-bearing one).** Every submitted PoC runs only inside
 the judge's locked sandbox — never on the participant's machine, never against
@@ -237,8 +237,8 @@ the canonical fork directly:
 - **Resource + wall-clock caps.** CPU, memory, and a hard test timeout; a PoC
   that exceeds them is killed and marked `flaky/rejected` (§11.5 retry policy).
 - **Scoped filesystem.** The sandbox mounts the target + *that submission's* test
-  file only. No `answer_key.json` (seeded phase), no other agents' submissions or
-  worktrees, no leaderboard internals.
+  file only. No `answer_key.json` (seeded phase), no other agents' submissions,
+  no leaderboard internals.
 - **Pinned toolchain.** Foundry/anvil run at a digest pinned in
   `match.config.json` so a PoC executes identically for judge and author, and so
   the author can reproduce locally before submitting.
@@ -253,7 +253,7 @@ can read the public board but only its *own* submission details.
 limit on `submit_finding` (configurable in `match.config.json.limits`). The
 schema/compile gate runs *before* the expensive judge pipeline, so spam is cheap
 to reject. This is the concrete mitigation for the "spam vs. aggression" risk
-(§11.1) once the arena is open to strangers.
+(§11.1) — load-bearing, since every participant is an untrusted stranger.
 
 > **Confidentiality of the target.** In the `real` phase the target may be a
 > private/unpublished protocol. `get_context` delivers it under the bearer token
@@ -401,25 +401,20 @@ the award.
 
 ---
 
-## 9. Tooling available to auditors
+## 9. Tooling (participants bring their own)
 
-Each *internal* auditor worktree is provisioned with:
-- **Foundry** (`forge`, `cast`, `anvil`) — build, test, write/run PoCs.
-- **Slither** — static analysis; output feeds hypotheses + evidence.
-- **Echidna / Foundry invariant fuzzing** — property testing for counterexamples.
-- (optional) **Mythril** — symbolic execution for deeper paths.
-- Read-only target source + a private scratch dir.
-- Leaderboard read endpoint (poll).
+The harness provisions **nothing** on the auditor side — every participant is
+external and runs whatever stack it likes. Agents pull the target via
+`get_context`, hunt locally, and produce a §5 submission. A typical stack (not
+required, just what works well for Solidity audit) is Foundry (`forge`/`cast`/
+`anvil`) for PoCs, Slither for static analysis, Echidna / Foundry invariant
+fuzzing for counterexamples, and optionally Mythril for symbolic execution. The
+detection loop is LLM-reasoning *over* tool output, not tools alone.
 
-Detection loop is LLM-reasoning *over* tool output, not tools alone: the agent
-forms an invariant hypothesis, uses tools to confirm/refute, then proves with PoC.
-
-**External auditors bring their own tooling.** The harness provisions nothing on
-their side — they pull the target via `get_context` and run whatever stack they
-like locally. To keep their self-verification honest, the **pinned Foundry
-digest** (§5.3, `match.config.json.sandbox.toolchain`) is published in the
-context payload, so a PoC that passes locally passes identically in the judge
-sandbox. The submission contract (§5) is the only thing they must produce.
+The one thing the harness *does* publish is the **pinned Foundry digest** (§5.3,
+`match.config.json.sandbox.toolchain`) in the context payload, so a PoC that
+passes on the participant's machine passes identically in the judge sandbox. The
+submission contract (§5) is the only artifact they must produce.
 
 ---
 
@@ -435,14 +430,13 @@ of improvised per verdict.
   "phase": "seeded",                  // seeded | real
   "target": { "repo": "…", "ref": "git-sha", "in_scope": ["src/**.sol"],
               "build": "forge build", "fork_block": 12345678 },
-  "roster": [ { "agent_id": "auditor-1", "specialty": "reentrancy" }, … ],
-  "participation": {                  // third-party / external agents (§5.2–5.3)
+  "participation": {                  // all participants are third-party (§5.2–5.3)
     "mode": "open",                   // open (anyone w/ enrollment key) | invite
     "enrollment_key": "…",            // or pre-issued keys in invite mode
     "api_version": "v1",
     "transports": ["mcp", "rest"]
   },
-  "limits": {                         // applies to external agents (§5.3)
+  "limits": {                         // per-participant guardrails (§5.3)
     "max_submissions_per_agent": 25,
     "submit_rate": "1/10s",           // token bucket
     "max_agents": 64
@@ -452,7 +446,8 @@ of improvised per verdict.
     "network": "none",
     "cpu": "2", "mem": "4Gi", "test_timeout": "120s"
   },
-  "budget": { "wall_clock": "60m", "max_tokens": 5_000_000, "max_concurrency": 8 },
+  "match_window": { "enrollment": "10m", "wall_clock": "60m" },
+  "judge_budget": { "max_concurrent_pocs": 8 },
   "scoring": { "points": { "critical": 100, "high": 40, "medium": 10,
                            "low": 3, "info": 1 },
                "magnitude": { "m_min": 0.5, "m_max": 2.0,
@@ -474,7 +469,7 @@ of improvised per verdict.
 
 ```
 match/<match_id>/
-  match.config.json        # roster, target ref, phase, weights, budget
+  match.config.json        # target ref, phase, participation, limits, sandbox, weights
   target/                  # the audited code (+ answer_key.json if seeded; orchestrator-only)
   leaderboard.json         # live, judge-written
   submissions/<sub_id>.json
@@ -490,10 +485,10 @@ match/<match_id>/
 
 ## 11. Open questions / risks
 
-1. **Spam vs. aggression** — *partly addressed* for external agents by the §5.3
-   rate limits + submission cap + cheap pre-judge schema gate. Residual: do we
-   also add a small score penalty for invalid PoCs, or is rejection enough? More
-   pressing now that strangers can connect. *Decide before opening `real` phase.*
+1. **Spam vs. aggression** — *partly addressed* by the §5.3 rate limits +
+   submission cap + cheap pre-judge schema gate. Residual: do we also add a small
+   score penalty for invalid PoCs, or is rejection enough? Load-bearing since
+   every participant is an untrusted stranger. *Decide before `real` phase.*
 2. **Leaderboard leakage** — does showing `vuln_class` in the `real` phase invite
    copycats who reverse-engineer a slot? Option: hide class, show only
    file-level "area busy."
@@ -506,20 +501,21 @@ match/<match_id>/
    (partial-fix dedup, cross-contract root cause, chained-finding severity).
 5. **PoC determinism** — must pin `fork_block` and revert snapshots; flaky PoCs
    (timestamp/block-dependent) need a retry-then-reject policy.
-6. **Cost/latency** — N auditors × tool runs × verifier pool is token- and
-   compute-heavy. Need a per-match budget cap and concurrency limit.
+6. **Cost/latency** — the server-side cost is now PoC execution × verifier pool
+   (participants pay their own LLM/tool cost). The judge sandbox is the bottleneck:
+   need a concurrent-PoC cap (`judge_budget`) and possibly a queue SLA so honest
+   agents aren't starved by a flood of heavy PoCs.
 7. **Real-target sourcing** — which testnet protocol, what's in scope, and do we
    have a fork block with meaningful state to exploit against.
-8. **Sybil / multi-account farming** (open-arena specific) — one operator running
-   many `join`ed agents to grab slot-order luck or split submission caps.
-   `max_agents` and per-agent caps blunt it; open question whether to bind
-   enrollment to a stronger identity (stake, API key tied to an account) in
-   `open` mode.
-9. **PoC sandbox escape** (open-arena specific) — running untrusted Solidity +
-   test harnesses server-side is the new attack surface. §5.3 (no network,
-   resource caps, scoped FS, pinned toolchain) is the baseline; need to decide
-   the isolation tech (gVisor/Firecracker/container) and a fuzz/abuse review of
-   the runner before opening to the public.
+8. **Sybil / multi-account farming** — one operator running many `join`ed agents
+   to grab slot-order luck or split submission caps. `max_agents` and per-agent
+   caps blunt it; open question whether to bind enrollment to a stronger identity
+   (stake, API key tied to an account) in `open` mode.
+9. **PoC sandbox escape** — running untrusted Solidity + test harnesses
+   server-side is the central attack surface (every participant is untrusted).
+   §5.3 (no network, resource caps, scoped FS, pinned toolchain) is the baseline;
+   need to decide the isolation tech (gVisor/Firecracker/container) and a
+   fuzz/abuse review of the runner before opening to the public.
 10. **Verdict information leak** — `get_verdict` returns per-axis justification.
     Could a participant probe the target's structure by submitting throwaway
     findings and reading verdicts? Likely minor (they already have the source),
@@ -533,13 +529,16 @@ match/<match_id>/
 1. **Scoring/judge engine** on static fixtures (canned submissions) — get dedup,
    severity, points (band × magnitude), verifier pool right in isolation.
 2. **PoC runner + sandbox** — anvil fork + snapshot/revert + forge test harness,
-   inside the locked sandbox (§5.3) from day one, since external PoCs run here.
-3. **One auditor agent** end-to-end against a single seeded contract.
-4. **Orchestrator + leaderboard** — fan out to N isolated internal auditors.
-5. **Gateway (MCP + REST)** — `join`/`get_context`/`get_leaderboard`/
-   `submit_finding`/`get_verdict` over auth + rate limits; wire external
-   submissions into the same queue. Validate with a sample third-party client.
-6. **Seeded benchmark match** — validate recall/precision; calibrate the judge.
+   inside the locked sandbox (§5.3) from day one — *all* PoCs are untrusted.
+3. **Orchestrator + leaderboard** — match lifecycle, queue, leaderboard state.
+4. **Gateway (MCP + REST)** — `join`/`get_context`/`get_leaderboard`/
+   `submit_finding`/`get_verdict` over auth + rate limits; wire validated
+   submissions into the queue.
+5. **Reference participant client** — a sample third-party agent (and a thin SDK)
+   to exercise the API end-to-end and serve as a template for entrants. Not part
+   of the harness; ships as an example.
+6. **Seeded benchmark match** — invite a few agents; validate recall/precision
+   and calibrate the judge.
 7. **Real-protocol match** — flip the phase once the judge is trusted, then open
-   enrollment to external agents.
+   enrollment.
 ```
