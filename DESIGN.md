@@ -1,0 +1,364 @@
+# Multiplayer Autoresearch — Competitive Whitehat Audit Harness
+
+**Status:** Design (v0.2) · **Deliverable:** architecture + data model + scoring spec
+**Date:** 2026-06-07 · **Companion:** `RUBRIC.md` (dedup & severity detail)
+
+A competition where multiple isolated LLM auditor agents race to find and prove
+security bugs in a DeFi protocol. Each agent works blind to the others but sees a
+live leaderboard of claimed bug slots. A judge verifies findings, dedups them,
+runs the attached Foundry PoC against an anvil fork, assigns Immunefi-style
+severity, and awards severity-weighted points. First valid report of a bug wins it.
+
+---
+
+## 1. Goals & non-goals
+
+**Goals**
+- Detect real vulnerabilities in Solidity DeFi code, with proof (runnable PoC).
+- Make detection *competitive* so we can compare agent designs/strategies.
+- Objective scoring: trustable enough that the leaderboard means something.
+- Two-phase target story: validate the harness on a **seeded benchmark** (known
+  answer key), then point it at a **real testnet protocol** (no answer key).
+
+**Non-goals (v0.1)**
+- Not a continuous always-on bounty service; runs are discrete "matches."
+- No on-chain prize settlement; points are off-chain JSON.
+- No agent-vs-agent collaboration or team play (single-player-isolated only).
+
+---
+
+## 2. Roles
+
+| Role | Count | Job |
+|---|---|---|
+| **Orchestrator** | 1 | Sets up the match, spawns auditors in isolated worktrees, owns the leaderboard, routes submissions to the judge, persists results. A workflow script. |
+| **Auditor agent** | N (2–8) | Reads target code, runs tools, finds bugs, writes PoC + fix, submits. Blind to peers; can read the live leaderboard. |
+| **Judge** | 1 (+verifier pool) | Validates each submission: dedups, runs the PoC against a fork, assigns severity, awards/denies points. |
+| **Fork host** | 1 | A single anvil fork of the target (shared execution substrate). Each PoC runs against a *snapshot* so agents can't poison each other's state. |
+
+### 2.1 Auditor specialties (diverse-role coverage)
+Each auditor is seeded with a primary lens to spread coverage; it may report
+anything but is *prompted* toward its lane:
+- `reentrancy` — external calls, CEI violations, cross-function/read-only reentrancy
+- `oracle-price` — price manipulation, stale/spot oracle, TWAP gaming
+- `access-control` — missing/incorrect auth, init/upgrade, privileged paths
+- `accounting` — rounding, share inflation, fee math, donation attacks
+- `economic-mev` — sandwich, liquidation incentives, governance/flashloan
+- `generalist` — free roam; catches what the lanes miss
+
+---
+
+## 3. Topology
+
+```
+                       ┌─────────────────────────────┐
+                       │       Orchestrator           │
+                       │  (workflow script, 1 proc)   │
+                       │  - match config              │
+                       │  - leaderboard (claimed slots)│
+                       │  - submission queue          │
+                       └───────────┬─────────────────┘
+                spawn N             │ route submissions
+        ┌────────────┬─────────────┼──────────────┐
+        ▼            ▼             ▼               ▼
+   ┌─────────┐  ┌─────────┐   ┌─────────┐    ┌──────────┐
+   │Auditor 1│  │Auditor 2│ … │Auditor N│    │  Judge   │
+   │worktree │  │worktree │   │worktree │    │ + verify │
+   │+tools   │  │+tools   │   │+tools   │    │  pool    │
+   └────┬────┘  └────┬────┘   └────┬────┘    └────┬─────┘
+        │ read-only target + own scratch          │ runs PoC
+        └──────────────┬──────────────────────────┘
+                       ▼
+                 ┌───────────┐
+                 │ anvil fork │  ← snapshot/revert per PoC
+                 │ (testnet)  │
+                 └───────────┘
+```
+
+**Isolation model:** each auditor gets its own git worktree containing a
+*read-only copy* of the target and a private scratch dir. Auditors cannot read
+each other's worktrees or submissions. The only shared, readable state is the
+**leaderboard** (see §6).
+
+---
+
+## 4. Match lifecycle
+
+1. **Setup** — Orchestrator loads `match.config.json`: target ref, phase
+   (`seeded`|`real`), auditor roster + specialties, time/turn budget, scoring
+   weights. Spins up the anvil fork and takes a baseline snapshot.
+2. **Recon broadcast** — Orchestrator gives every auditor identical context:
+   target source, build instructions, in-scope contracts, known assumptions,
+   the submission schema, and the leaderboard endpoint.
+3. **Hunt (parallel, isolated)** — auditors run their loop: read → run tools →
+   hypothesize → write PoC → self-verify → submit. They poll the leaderboard to
+   avoid spending time on already-claimed slots.
+4. **Adjudication (streaming)** — each submission is judged as it arrives
+   (pipeline, not barrier): dedup → PoC run → severity → award. Result is
+   written back to the leaderboard so other agents see the slot close.
+5. **Close** — when budget/time exhausts, orchestrator freezes the board,
+   computes final standings, and (in seeded phase) scores against the answer key.
+6. **Report** — emit `match-result.json` + a human-readable summary: per-agent
+   findings, points, recall/precision (seeded), and a deduped master vuln list.
+
+---
+
+## 5. Submission contract (agent → judge)
+
+A submission is rejected at intake if it fails schema validation or the PoC
+doesn't compile. **PoC is mandatory; the `suggested_fix.patch` is also mandatory
+in the `seeded` phase** — it powers the fix-equivalence dedup test (`RUBRIC.md`
+§A.4), the most reliable dedup signal. Optional in `real` phase, but borderline
+dedup then falls to expensive LLM adjudication.
+
+```jsonc
+{
+  "submission_id": "uuid",
+  "agent_id": "auditor-3",
+  "agent_specialty": "oracle-price",
+  "timestamp": "iso8601",
+
+  // --- structured finding ---
+  "title": "Spot-price oracle lets attacker drain lending pool",
+  "vuln_class": "oracle-manipulation",          // controlled vocab (see §5.1)
+  "location": [{ "file": "src/Lending.sol", "lines": "142-167" }],
+  "claimed_severity": "critical",               // hint only; judge decides
+  "description": "…root cause…",
+  "attack_scenario": "…step-by-step…",
+  "impact": "…funds at risk / who loses what…",
+
+  // --- proof (mandatory) ---
+  "poc": {
+    "framework": "foundry",
+    "test_file": "test/PoC_OracleDrain.t.sol",  // self-contained
+    "test_fn": "test_drain",
+    "expected_assertion": "attacker balance increases by >= X",
+    "fork_block": 12345678                       // pin for determinism
+  },
+
+  // --- remediation (patch mandatory in seeded phase) ---
+  "suggested_fix": {
+    "summary": "Use a TWAP / Chainlink feed instead of spot reserves",
+    "patch": "unified diff — required (powers the fix-equivalence dedup test)"
+  },
+
+  // --- evidence (optional, informs confidence) ---
+  "evidence": {
+    "tools": ["slither: reentrancy-eth @ Lending.sol:150", "echidna: counterexample …"],
+    "self_confidence": 0.0
+  }
+}
+```
+
+### 5.1 Vuln-class vocabulary (for dedup + analytics)
+`reentrancy`, `oracle-manipulation`, `access-control`, `arithmetic/rounding`,
+`share-inflation`, `donation`, `unchecked-return`, `dos`, `front-running/mev`,
+`governance`, `upgradeability`, `signature-replay`, `logic-error`, `other`.
+
+---
+
+## 6. Leaderboard (the only shared state)
+
+Auditors can **read** this; only the judge **writes** it. It exposes *what is
+claimed*, not *how* — enough to redirect effort, not enough to copy a finding.
+
+```jsonc
+{
+  "match_id": "…",
+  "phase": "seeded",
+  "elapsed": "00:14:32",
+  "claimed_slots": [
+    { "slot_id": "S1", "vuln_class": "oracle-manipulation",
+      "location_hint": "src/Lending.sol", "severity": "critical",
+      "status": "awarded", "winner": "auditor-3" },
+    { "slot_id": "S2", "vuln_class": "reentrancy",
+      "location_hint": "src/Vault.sol", "status": "under-review" }
+  ],
+  "standings": [ { "agent": "auditor-3", "points": 100, "valid": 1, "invalid": 0 } ]
+}
+```
+
+> **Anti-herding note:** `location_hint` is file-level only, never line-level,
+> and the description/PoC are never exposed. This creates "this area is taken"
+> race pressure without leaking the actual bug. Open question (§11): whether to
+> hide `vuln_class` too in the `real` phase to reduce copycat risk.
+
+---
+
+## 7. Judge & scoring
+
+### 7.1 Adjudication pipeline (per submission)
+1. **Schema/compile gate** — invalid schema or non-compiling PoC → `rejected`
+   (no penalty in v0.1; see §11 on spam control).
+2. **Dedup** — compare against awarded + under-review findings using the staged
+   fingerprint pipeline in `RUBRIC.md` §A (locality screen → fix-equivalence test
+   → semantic adjudication). Two findings are duplicates iff they share the same
+   fix. Duplicate → `dup`; points go to the **earliest valid** submitter, ordered
+   by a single orchestrator intake clock (not agent-reported timestamps, which
+   are spoofable — `RUBRIC.md` §A.5).
+3. **PoC execution** — run `test_fn` against a **fresh fork snapshot** at
+   `fork_block`. Must pass and its assertion must actually demonstrate the
+   claimed impact. Fork is reverted after each run.
+4. **Severity assignment (Immunefi-style)** — judge sets severity from
+   impact × likelihood per the rubric in §7.2, using the PoC as evidence. The
+   agent's `claimed_severity` is only a hint. PoC caps severity: no
+   demonstrated fund-loss/insolvency → capped at Medium.
+5. **Award** — points by final severity (§7.3), plus bonuses; write to board.
+
+### 7.2 Severity rubric (Immunefi-flavored)
+| Severity | Definition (DeFi) |
+|---|---|
+| **Critical** | Direct theft/permanent freezing of funds, protocol insolvency, unauthorized mint. |
+| **High** | Theft/freezing under specific conditions; significant but bounded loss. |
+| **Medium** | Griefing, temporary DoS, value leak without direct theft. |
+| **Low** | Limited-impact issues, needs unlikely preconditions. |
+| **Info** | Best-practice / no direct security impact. |
+
+Severity is computed from an explicit `impact × likelihood` matrix
+(`RUBRIC.md` §B.3), not vibed. **Every verdict must record both axis levels
+(`impact_level`, `likelihood_level`), the resulting matrix cell, and a one-line
+justification per axis.** This is a required field, not optional: it makes
+scores auditable and makes the appeals lane (§11.3) tractable — an appeal
+challenges a specific axis level, not an overall feeling. The PoC caps the
+impact axis: no demonstrated effect → no claimed impact (`RUBRIC.md` §B.1).
+
+### 7.3 Points
+| Severity | Base points |
+|---|---|
+| Critical | 100 |
+| High | 40 |
+| Medium | 10 |
+| Low | 3 |
+| Info | 1 |
+
+**Bonuses (multiplicative/additive, capped):**
+- Correct, minimal `suggested_fix` patch that applies: **+15%**
+- Clean self-contained PoC (no judge edits needed): **+10%**
+- First blood on a slot already: inherent (dupes get 0).
+
+**No penalties in v0.1** beyond wasted budget. Rationale: keep agents
+aggressive; revisit if spam dominates (§11).
+
+### 7.4 Verifier pool (anti-judge-error)
+For Critical/High awards, fan out 3 independent verifier sub-judges, each
+prompted to **refute** the finding (re-run PoC, challenge severity). Award
+stands only if ≥2 of 3 confirm. Cheap insurance against false criticals.
+
+The pool also covers **dedup verdicts**, not just severity — a wrong `dup`
+silently zeroes a real finding (the false-negative gap in §11.3). For any `dup`
+that denies points to a finding whose **own PoC passed**, require a second judge
+to confirm the dup before zeroing it (`RUBRIC.md` §C.5). False positives lose a
+duplicate; false negatives lose a real bug — so we verify the denial, not just
+the award.
+
+---
+
+## 8. Seeded-vs-real scoring
+
+- **Seeded phase:** target ships with `answer_key.json` (planted bugs +
+  canonical location + intended severity). After close, compute per agent:
+  **recall** (planted bugs found / total planted), **precision** (valid /
+  submitted), **F1**, and severity-weighted recall. This validates that the
+  judge's point scores correlate with ground truth before we trust it on real
+  code. The answer key is **never** exposed to auditors or the live judge during
+  the match — only used in post-hoc scoring.
+- **Real phase:** no answer key. The judge's awarded points + the deduped master
+  vuln list *are* the result. Confidence comes from the PoC gate + verifier pool.
+  This is why we run seeded first: to calibrate trust in the judge.
+
+---
+
+## 9. Tooling available to auditors
+
+Each auditor worktree is provisioned with:
+- **Foundry** (`forge`, `cast`, `anvil`) — build, test, write/run PoCs.
+- **Slither** — static analysis; output feeds hypotheses + evidence.
+- **Echidna / Foundry invariant fuzzing** — property testing for counterexamples.
+- (optional) **Mythril** — symbolic execution for deeper paths.
+- Read-only target source + a private scratch dir.
+- Leaderboard read endpoint (poll).
+
+Detection loop is LLM-reasoning *over* tool output, not tools alone: the agent
+forms an invariant hypothesis, uses tools to confirm/refute, then proves with PoC.
+
+---
+
+## 9a. Match configuration (`match.config.json`)
+
+Referenced throughout; defined here. The `threat_model` block is what makes the
+severity guardrails (`RUBRIC.md` §B.4) explicit and uniform per target instead
+of improvised per verdict.
+
+```jsonc
+{
+  "match_id": "…",
+  "phase": "seeded",                  // seeded | real
+  "target": { "repo": "…", "ref": "git-sha", "in_scope": ["src/**.sol"],
+              "build": "forge build", "fork_block": 12345678 },
+  "roster": [ { "agent_id": "auditor-1", "specialty": "reentrancy" }, … ],
+  "budget": { "wall_clock": "60m", "max_tokens": 5_000_000, "max_concurrency": 8 },
+  "scoring": { "points": { "critical": 100, "high": 40, "medium": 10,
+                           "low": 3, "info": 1 },
+               "bonuses": { "applied_fix": 0.15, "clean_poc": 0.10 } },
+  "threat_model": {
+    "trusted_roles": ["owner (3/5 multisig)", "governance timelock"],
+    "accepted_assumptions": ["price feeds are honest within 1 block"],
+    "out_of_scope": ["gas optimizations", "centralization of owner key"]
+  },
+  "require_fix_patch": true            // enforced true in seeded phase
+}
+```
+
+---
+
+## 10. Data model & artifacts
+
+```
+match/<match_id>/
+  match.config.json        # roster, target ref, phase, weights, budget
+  target/                  # the audited code (+ answer_key.json if seeded; orchestrator-only)
+  leaderboard.json         # live, judge-written
+  submissions/<sub_id>.json
+  pocs/<sub_id>/…          # PoC test files as submitted
+  verdicts/<sub_id>.json   # decision, dedup result, (impact_level, likelihood_level,
+                           #   cell, per-axis justification), verifier votes
+  match-result.json        # final standings, master vuln list
+  report.md                # human summary (+ recall/precision if seeded)
+```
+
+---
+
+## 11. Open questions / risks
+
+1. **Spam vs. aggression** — no-penalty scoring may flood the judge with
+   low-quality submits. Mitigation options: per-agent submission cap, small
+   penalty for invalid PoCs, or rate-limited intake. *Decide before real phase.*
+2. **Leaderboard leakage** — does showing `vuln_class` in the `real` phase invite
+   copycats who reverse-engineer a slot? Option: hide class, show only
+   file-level "area busy."
+3. **Judge as single point of bias** — *partly addressed:* verifier pool now
+   covers false criticals AND point-denying dups (§7.4). Still open: an appeals
+   lane where a rejected agent requests a second panel against a specific
+   severity axis (the per-axis justification in §7.2 makes this tractable).
+4. **Dedup hardness** — *addressed* by the fingerprint pipeline + fix-equivalence
+   test in `RUBRIC.md` §A. Residual open edges tracked in `RUBRIC.md` §D
+   (partial-fix dedup, cross-contract root cause, chained-finding severity).
+5. **PoC determinism** — must pin `fork_block` and revert snapshots; flaky PoCs
+   (timestamp/block-dependent) need a retry-then-reject policy.
+6. **Cost/latency** — N auditors × tool runs × verifier pool is token- and
+   compute-heavy. Need a per-match budget cap and concurrency limit.
+7. **Real-target sourcing** — which testnet protocol, what's in scope, and do we
+   have a fork block with meaningful state to exploit against.
+
+---
+
+## 12. Suggested build order (when we move past design)
+
+1. **Scoring/judge engine** on static fixtures (canned submissions) — get dedup,
+   severity, points, verifier pool right in isolation.
+2. **PoC runner** — anvil fork + snapshot/revert + forge test harness.
+3. **One auditor agent** end-to-end against a single seeded contract.
+4. **Orchestrator + leaderboard** — fan out to N isolated auditors.
+5. **Seeded benchmark match** — validate recall/precision; calibrate the judge.
+6. **Real-protocol match** — flip the phase once the judge is trusted.
+```
